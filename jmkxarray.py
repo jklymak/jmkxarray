@@ -1,138 +1,201 @@
-import matplotlib
-import matplotlib.cm
-import matplotlib.pyplot as plt
-import matplotlib.units as munits
-import matplotlib.dates as mdates
-import matplotlib.colors as mcolors
+import xarray as xr
 import numpy as np
-import datetime
+import scipy
+import logging
 
-converter = mdates.ConciseDateConverter()
-munits.registry[np.datetime64] = converter
-munits.registry[datetime.date] = converter
-munits.registry[datetime.datetime] = converter
+_log = logging.getLogger(__name__)
 
-def onewidths(nrows=1, ncols=1, vext=0.3, **kwargs):
+def gappy_interp(ds, *, dim='', xgrid=None, maxgap=np.Inf):
     """
+    interp ds on xgrid along dimension dim.  However don't
+    interpolate across gaps larger than maxgap.
+
+    Parameters
+    ----------
+    ds : xarray.DataSet or xarray.DataFrame
+        data frame.  Must have *dim* as a dimension
+    dim : string
+        dimension to interpolate on.
+    xgrid : array
+        grid to interpolate to in dimension *dim*
+    maxgap : float
+        maximum size of gap in *dim* to interpolate across
+
+    Returns
+    -------
+    DataSet or DataArray with dim=xgrid.
+
+    Examples
+    --------
+    Note in the below that the gap from x=1 to 2.1 is _not_ interpolated over.
+
+    >>> da = xr.DataArray(
+        ...     data=[[1, 2, 3, 4, 5, 6]],
+        ...     dims=("x"),
+        ...     coords={"x": [0, 0.5, 1, 2.1, 2.5, 3.4]},
+        ... )
+    >>> dn = gappy_interp(da, dim='x', xgrid=np.arange(0, 3.1, 0.2), maxgap=1.0)
+    >>> dn
+    <xarray.DataArray (x: 16)>
+    array([1.        , 1.4       , 1.8       , 2.2       , 2.6       ,
+           3.        ,        nan,        nan,        nan,        nan,
+           nan, 4.25      , 4.75      , 5.11111111, 5.33333333, 5.55555556])
+    Coordinates:
+    * x        (x) float64 0.0 0.2 0.4 0.6 0.8 1.0 1.2 ... 2.0 2.2 2.4 2.6 2.8 3.0
     """
-    wid = 255 / 72
-    height = 10 * vext
-    fsize = kwargs.pop('figsize', None)
-    if fsize is None:
-        fsize = (wid, height)
-    return plt.subplots(nrows, ncols, figsize=fsize, **kwargs)
+
+    x0 = ds[dim].values
+    print('xgrid:', xgrid)
+    print('dim', dim)
+    ds = ds.interp(**{dim:xgrid})
+    dx = np.diff(x0)
+    bad = (dx > maxgap).nonzero()[0]
+    print("Bad", bad)
+    mask = np.isfinite(xgrid)
+    for b in bad:
+        print("B", b, x0[b], x0[b+1])
+        mask[(xgrid > x0[b]) & (xgrid < x0[b+1])] = False
+    mask = xr.DataArray(mask, dims=(dim))
+    return ds.where(mask)
 
 
-def twowidths(nrows=1, ncols=1, vext=0.3, **kwargs):
-    wid = 539 / 72
-    height = 10 * vext
-    fsize = kwargs.pop('figsize', None)
-    if fsize is None:
-        fsize = (wid, height)
-    return plt.subplots(nrows, ncols, figsize=fsize, **kwargs)
-
-
-def djmkfigure(width,vext):
+def depth_to_iso(ds, pden='pden', depths='depths', xdim='along'):
     """
-    djmkfigure(width, vext):
-    width is column widths, and vext is fractional 10 page height.
+    Map fields in this dataset to potential density coordinates.
+
+    Parameters
+    -----------
+
+    ds : xarray Dataset
+        Dataset that at least has *pden* and *depths* fields to map to
+
+    pden : str (default 'pden')
+        Name of Array in *ds* that has the density information.
+
+    depths : str (default 'depths')
+        Name of depth coordinate that has depth information.
+
+    xdim : str (default 'along')
+        Name of x coordinate of the data set
     """
-    wid = 3*width+3./8.;
-    height = 10*vext;
-    plt.rc('figure',figsize=(wid,height),dpi=96)
-    plt.rc('font',size=9)
-    plt.rc('font',family='sans-serif');
-    # rcParams['font.sans-serif'] = ['Verdana']
-    plt.rc('axes',labelsize='large')
-    leftin = 0.75
-    rightin = 0.25
-    botin = 0.4
-    plt.rc('figure.subplot',left=leftin/wid)
-    plt.rc('figure.subplot',right=(1-rightin/wid))
-    plt.rc('figure.subplot',bottom=botin/height)
 
-def jmkprint(fname,pyname,dirname='doc',dpi=150,optcopy=False,bbinch=None):
+    pden0 = ds[pden].mean(dim=xdim)
+    isodepths = ds[depths].where(pden0 > 0).dropna(dim=depths)
+    pden0 = pden0.dropna(dim=depths)
+
+    M = pden0.shape[0]
+    N = ds[xdim].shape[0]
+
+    dsiso = xr.Dataset(coords={'isodepths': isodepths, xdim: ds[xdim]})
+    for td in ds.variables:
+        _log.info('todo', td)
+        if td == xdim:
+            pass
+        elif ds[td].shape == ds[xdim].shape:
+            dsiso[td] = (xdim, ds[td].values)
+        elif ds[td].shape == ds[pden].shape:
+            dsiso[td] = (('isodepths', xdim), np.zeros((M, N)))
+            for i in range(N):
+                dsiso[td][:, i] = np.interp(pden0, ds[pden][:, i], ds[td].values[:, i])
+        else:
+            try:
+                dsiso[td] = ds[td]
+            except ValueError:
+                pass
+
+    return dsiso
+
+
+def get_n_blocks(nfft, N, noverlap_min=None):
+    if noverlap_min is None:
+        noverlap_min = nfft / 2
+    for m in range(2, 500):
+        noverlap = np.ceil(- (N - m * nfft) / (m - 1))
+        if noverlap > 0 and noverlap >= noverlap_min:
+            total = m * nfft - (m-1) * noverlap
+            if total == nfft:
+                noverlap = 0
+            return int(noverlap), int(total), m
+
+
+def power_spec(da, nfft=256, xdim='along', ydim='depths', xunits='km',
+               dataunits='kg/m^3'):
+
     """
-    def jmkprint(fname,pyname)
-    def jmkprint(fname,pyname,dirname='doc')
+    Calculate power spectra segments of a DataArray and return as a Dataset.
+
+    Parameters
+    ----------
+
+    da : DataArray
+        data array to calculate spectra over.  Spectra are calculated in the second dimension,
+        usually something like "x" or "time".
+
+    nfft : integer
+        length of FFT blocks
+
+    xdim : string
+        dimension in DataArray to calculate spectra along.
+
+    ydim : string
+        dimension in DataArray over which we iterate to calculate the spectra.
+
+    xunits : string
+        units of the xdimension
+
+    dataunits : string
+        units of the data that is being analyzed
+
+    Returns
+    -------
+
+    ps : DataSet
+        Data set with coordinates (blocks, depths, kx), if ydim is "depths".  Note that you
+        may want to rename the coordinates if kx is a frequency.  Note that kx has units of
+        cycles / km, *not* rad / km.  The spectrum has units of V^2 / cpkm, if "V" are the
+        units of the data in *da*, and is normalized so that the integral of S(kx) dkx is
+        equal to the variance of the signal in *da*.
+
     """
-    import os,shutil
+    N = da[xdim].shape[0]
+    window = np.hanning(nfft)
+    wnorm = (window * window).sum() / nfft
+    noverlap, total, nblocks = get_n_blocks(nfft, N, noverlap_min=nfft/2)
+    _log.info(noverlap, nblocks)
+    dx = da[xdim].diff(dim=xdim).median().values
+    kx = np.arange(0, 1/2, 1/nfft) / dx
 
-    fig = plt.gcf()
-    print(fig)
-    try:
-        os.mkdir(dirname)
-    except:
-        pass
+    ps =  xr.Dataset(coords={'blocks': np.arange(nblocks), 'depths': da[ydim], 'kx': kx })
+    ps['kx'].attrs = {'description': 'wavenumber or frequency',
+                      'units': f'cycles per {xunits}'}
+    ps['spectrum'] = (('blocks', 'depths', 'kx'), np.zeros((nblocks, da[ydim].shape[0], len(kx))))
+    ps['spectrum'].attrs = {'description': 'un-averaged power spectra from overlaping blocks',
+                            'units': f'({dataunits})^2 / cp{xunits}',
+                            'source': f'{da.name}'}
+    ps['along_start'] = (('blocks'), np.zeros(nblocks))
+    ps['along_stop'] = (('blocks'), np.zeros(nblocks))
+    ps['along_start'].attrs = {'description' : f'start of the block in {xdim}'}
+    ps['along_stop'].attrs = {'description' : f'start of the block in {xdim}'}
+    ps['blocks'].attrs = {'description' : 'block index for the spectral estimates'}
 
-    if dirname=='doc':
-        pwd=os.getcwd()+'/doc/'
-    else:
-        pwd=dirname+'/'
-    fig.savefig(dirname+'/'+fname+'.pdf',dpi=dpi,bbox_inches=bbinch)
-    fig.savefig(dirname+'/'+fname+'.png',dpi=dpi,bbox_inches=bbinch)
-    fig.savefig(dirname+'/'+fname+'.svg',dpi=dpi,bbox_inches=bbinch)
+    start = 0
+    for nn in range(nblocks):
+        stop = start + nfft
+        _log.info(start, stop, da.isel({xdim: slice(start, stop)}).shape)
+        xx = da.isel({xdim: slice(start, stop)})
+        xx = xx - xx.mean(dim=xdim)
+        ff = np.fft.fft(xx * window, axis=1)
+        pp = ff[:, :int(nfft/2)]*np.conj(ff[:, :int(nfft/2)]) * 2 / nfft / dx / wnorm
+        ps['spectrum'][nn, :, : ] = np.real(pp)
+        ps['along_start'][nn] = da[xdim].isel(along=start)
+        ps['along_stop'][nn] = da[xdim].isel(along=stop-1)
+        start = stop - noverlap
+    ps.attrs = {'nblocks': nblocks, 'noverlap': noverlap, 'nfft': nfft}
 
-    str="""\\begin{{figure*}}[htbp]
-  \\begin{{center}}
-    \\includegraphics[width=\\twowidth]{{{fname}}}
-    \\caption{{
-      \\tempS{{\\footnotesize {pwd}/{pyname} ;
-        {pwd}{fname}.pdf}}
-      \\label{{fig:{fname}}} }}
-  \\end{{center}}
-\\end{{figure*}}""".format(pwd=pwd,pyname=pyname,fname=fname)
-
-    with open(dirname+'/'+fname+'.tex','w') as fout:
-        fout.write(str)
-
-    cmd = 'less '+dirname+'/%s.tex | pbcopy' % fname
-    os.system(cmd)
-    if optcopy:
-        shutil.copy(dirname+'/'+fname+'.png',optcopy)
-
-
-def tsdiagramjmk(salt,temp,cls=[]):
-    import numpy as np
-    import seawater
-    import matplotlib.pyplot as plt
+    return ps
 
 
-    # Figure out boudaries (mins and maxs)
-    smin = salt.min() - (0.01 * salt.min())
-    smax = salt.max() + (0.01 * salt.max())
-    tmin = temp.min() - (0.1 * temp.max())
-    tmax = temp.max() + (0.1 * temp.max())
-
-    # Calculate how many gridcells we need in the x and y dimensions
-    xdim = round((smax-smin)/0.1+1,0)
-    ydim = round((tmax-tmin)+1,0)
 
 
-    # Create empty grid of zeros
-    dens = np.zeros((ydim,xdim))
 
-    # Create temp and salt vectors of appropiate dimensions
-    ti = np.linspace(1,ydim-1,ydim)+tmin
-    si = np.linspace(1,xdim-1,xdim)*0.1+smin
 
-    # Loop to fill in grid with densities
-    for j in range(0,int(ydim)):
-        for i in range(0, int(xdim)):
-            dens[j,i]=seawater.dens(si[i],ti[j],0)
-
-    # Substract 1000 to convert to sigma-t
-    dens = dens - 1000
-
-    # Plot data ***********************************************
-    if not(cls==[]):
-        CS = plt.contour(si,ti,dens, cls,linestyles='dashed', colors='k')
-    else:
-        CS = plt.contour(si,ti,dens,linestyles='dashed', colors='k')
-
-    plt.clabel(CS, fontsize=9, inline=1, fmt='%1.2f') # Label every second level
-    ax1=gca()
-    #    ax1.plot(salt,temp,'or',markersize=4)
-
-    ax1.set_xlabel('S [psu]')
-    ax1.set_ylabel('T [C]')
